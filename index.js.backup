@@ -1,0 +1,863 @@
+import { exec } from "child_process";
+import cors from "cors";
+import dotenv from "dotenv";
+import express from "express";
+import { promises as fs } from "fs";
+import Groq from "groq-sdk";
+
+dotenv.config();
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
+
+const murfApiKey = process.env.MURF_API_KEY;
+
+// You can use either a Murf voice ID like "en-US-natalie"
+// or just the voice actor name like "Natalie"
+const MURF_VOICE_ID = process.env.MURF_VOICE_ID || "Natalie";
+const MURF_LOCALE = process.env.MURF_LOCALE || "en-US";
+
+const app = express();
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(cors());
+
+const port = process.env.PORT || 3125;
+
+// Your paths
+const RHUBARB_PATH =
+  "C:\\Rhubarb\\Rhubarb-Lip-Sync-1.14.0-Windows\\rhubarb.exe";
+
+const FFMPEG_PATH =
+  "C:\\ffmpeg-2026-03-26-git-fd9f1e9c52-essentials_build\\bin\\ffmpeg.exe";
+
+app.get("/", (req, res) => {
+  res.send("Groq + Murf backend is running");
+});
+
+// Optional: list Murf voices
+app.get("/voices", async (req, res) => {
+  try {
+    if (!murfApiKey) {
+      return res.status(400).send({ error: "MURF_API_KEY is missing" });
+    }
+
+    const response = await fetch("https://api.murf.ai/v1/speech/voices", {
+      method: "GET",
+      headers: {
+        "api-key": murfApiKey,
+      },
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Murf voices error: ${response.status} - ${errText}`);
+    }
+
+    const voices = await response.json();
+    return res.send(voices);
+  } catch (error) {
+    console.error("Voices fetch error:", error);
+    return res.status(500).send({
+      error: "Failed to fetch Murf voices",
+      details: error.message,
+    });
+  }
+});
+
+const execCommand = (command) => {
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        console.error("Exec Error:", error);
+        console.error("stderr:", stderr);
+        reject(error);
+        return;
+      }
+
+      if (stderr) {
+        console.warn("Command stderr:", stderr);
+      }
+
+      resolve(stdout);
+    });
+  });
+};
+
+const ensureAudiosFolder = async () => {
+  try {
+    await fs.mkdir("audios", { recursive: true });
+  } catch (error) {
+    console.error("Error creating audios folder:", error);
+  }
+};
+
+const readJsonTranscript = async (file) => {
+  const data = await fs.readFile(file, "utf8");
+  return JSON.parse(data);
+};
+
+const audioFileToBase64 = async (file) => {
+  const data = await fs.readFile(file);
+  return data.toString("base64");
+};
+
+// Download file from URL if Murf returns audioFile instead of encodedAudio
+const downloadFile = async (url, outputFilePath) => {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Audio download failed: ${response.status} - ${errText}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  await fs.writeFile(outputFilePath, buffer);
+};
+
+// Murf TTS
+const generateMurfAudio = async (text, outputFilePath) => {
+  if (!murfApiKey) {
+    throw new Error("MURF_API_KEY is missing");
+  }
+
+  const response = await fetch("https://api.murf.ai/v1/speech/generate", {
+    method: "POST",
+    headers: {
+      "api-key": murfApiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text,
+      voiceId: MURF_VOICE_ID,
+      locale: MURF_LOCALE,
+      format: "MP3",
+      sampleRate: 44100,
+      channelType: "MONO",
+      encodeAsBase64: true,
+      modelVersion: "GEN2",
+      rate: 0,
+      pitch: 0,
+      variation: 1,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Murf TTS failed: ${response.status} - ${errText}`);
+  }
+
+  const data = await response.json();
+
+  // Preferred: write encoded audio directly
+  if (data?.encodedAudio) {
+    const buffer = Buffer.from(data.encodedAudio, "base64");
+    await fs.writeFile(outputFilePath, buffer);
+    return;
+  }
+
+  // Fallback: download from audioFile URL
+  if (data?.audioFile) {
+    await downloadFile(data.audioFile, outputFilePath);
+    return;
+  }
+
+  throw new Error("Murf response did not contain encodedAudio or audioFile");
+};
+
+const lipSyncMessage = async (messageIndex) => {
+  const time = Date.now();
+  console.log(`Starting conversion for message ${messageIndex}`);
+
+  const mp3Path = `audios/message_${messageIndex}.mp3`;
+  const wavPath = `audios/message_${messageIndex}.wav`;
+  const jsonPath = `audios/message_${messageIndex}.json`;
+
+  await execCommand(`"${FFMPEG_PATH}" -y -i "${mp3Path}" "${wavPath}"`);
+  console.log(`MP3 to WAV done in ${Date.now() - time}ms`);
+
+  await execCommand(
+    `"${RHUBARB_PATH}" -f json -o "${jsonPath}" "${wavPath}" -r phonetic`
+  );
+  console.log(`Lip sync done in ${Date.now() - time}ms`);
+};
+
+app.post("/chat", async (req, res) => {
+  try {
+    if (pythonMode) {
+       console.log("🔒 /chat blocked — pythonMode active");
+    return res.status(423).json({ error: "python mode active" });
+  }
+    await ensureAudiosFolder();
+
+    const userMessage = req.body.message;
+
+    if (!userMessage) {
+      return res.send({
+        messages: [
+          {
+            text: "Hey dear. How was your day?",
+            audio: await audioFileToBase64("audios/intro_0.wav"),
+            lipsync: await readJsonTranscript("audios/intro_0.json"),
+            facialExpression: "smile",
+            animation: "Talking_1",
+          },
+          {
+            text: "I missed you so much... Please don't go for so long!",
+            audio: await audioFileToBase64("audios/intro_1.wav"),
+            lipsync: await readJsonTranscript("audios/intro_1.json"),
+            facialExpression: "sad",
+            animation: "Crying",
+          },
+        ],
+      });
+    }
+
+    if (!murfApiKey || !process.env.GROQ_API_KEY) {
+      return res.send({
+        messages: [
+          {
+            text: "Please don't forget to add your API keys!",
+            audio: await audioFileToBase64("audios/api_0.wav"),
+            lipsync: await readJsonTranscript("audios/api_0.json"),
+            facialExpression: "angry",
+            animation: "Angry",
+          },
+          {
+            text: "Make sure both Groq and Murf keys are set correctly.",
+            audio: await audioFileToBase64("audios/api_1.wav"),
+            lipsync: await readJsonTranscript("audios/api_1.json"),
+            facialExpression: "smile",
+            animation: "Laughing",
+          },
+        ],
+      });
+    }
+
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.6,
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a virtual girlfriend.
+Always reply ONLY in valid JSON.
+
+Format:
+{
+  "messages": [
+    {
+      "text": "string",
+      "facialExpression": "smile | sad | angry | surprised | funnyFace | default",
+      "animation": "Talking_0 | Talking_1 | Talking_2 | Crying | Laughing | Rumba | Idle | Terrified | Angry"
+    }
+  ]
+}
+
+Rules:
+- Maximum 3 messages
+- No extra explanation
+- No markdown
+- No text outside JSON
+          `,
+        },
+        {
+          role: "user",
+          content: userMessage || "Hello",
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content || "";
+    console.log("Groq raw response:", raw);
+
+    let messages;
+
+    try {
+      const parsed = JSON.parse(raw);
+      messages = parsed.messages ? parsed.messages : parsed;
+    } catch (error) {
+      console.error("JSON parse error:", error);
+      messages = [
+        {
+          text: raw || "Sorry, I could not understand that properly.",
+          facialExpression: "default",
+          animation: "Talking_1",
+        },
+      ];
+    }
+
+    if (!Array.isArray(messages)) {
+      messages = [messages];
+    }
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      const fileName = `audios/message_${i}.mp3`;
+      const textInput = message.text || "Hello";
+
+      console.log(`Generating audio for message ${i}: ${textInput}`);
+
+      try {
+        await generateMurfAudio(textInput, fileName);
+        await lipSyncMessage(i);
+
+        message.audio = await audioFileToBase64(fileName);
+        message.lipsync = await readJsonTranscript(`audios/message_${i}.json`);
+      } catch (ttsError) {
+        console.error(`TTS/Lipsync failed for message ${i}:`, ttsError.message);
+
+        // keep chat alive even if TTS fails
+        message.audio = null;
+        message.lipsync = { mouthCues: [] };
+      }
+    }
+
+    return res.send({ messages });
+  } catch (error) {
+    console.error("Chat route error:", error);
+    return res.status(500).send({
+      error: "Something went wrong in /chat",
+      details: error.message,
+    });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Virtual Girlfriend listening on port ${port}`);
+  console.log(`Rhubarb path: ${RHUBARB_PATH}`);
+  console.log(`FFmpeg path: ${FFMPEG_PATH}`);
+  console.log(`Murf voice: ${MURF_VOICE_ID}`);
+  console.log(`Murf locale: ${MURF_LOCALE}`);
+});
+
+
+let latestTranscript = "";
+
+// app.post("/lip-sync", async (req, res) => {
+//   try {
+//     await ensureAudiosFolder();
+//     const { audioBase64 } = req.body;
+//     if (!audioBase64) return res.status(400).send("No audioBase64 provided");
+
+//     const audioBuffer = Buffer.from(audioBase64, "base64");
+//     const mp3Path = `audios/api_lipsync.mp3`;
+//     const wavPath = `audios/api_lipsync.wav`;
+//     const jsonPath = `audios/api_lipsync.json`;
+
+//     await fs.writeFile(mp3Path, audioBuffer);
+
+//     console.log("Starting custom lip-sync conversion...");
+//     await execCommand(`"${FFMPEG_PATH}" -y -i "${mp3Path}" "${wavPath}"`);
+//     await execCommand(`"${RHUBARB_PATH}" -f json -o "${jsonPath}" "${wavPath}" -r phonetic`);
+
+//     const lipsync = await readJsonTranscript(jsonPath);
+//     res.send({ lipsync });
+//   } catch (err) {
+//     console.error("Lip-sync error:", err);
+//     res.status(500).send({ error: err.message });
+//   }
+// });
+
+app.post("/lip-sync", async (req, res) => {
+  try {
+    await ensureAudiosFolder();
+    const { audioBase64 } = req.body;
+    if (!audioBase64) return res.status(400).send("No audioBase64 provided");
+
+    console.log(`💋 Lip-sync audio size: ${audioBase64.length} chars`);
+
+    const audioBuffer = Buffer.from(audioBase64, "base64");
+    const mp3Path  = `audios/api_lipsync.mp3`;
+    const wavPath  = `audios/api_lipsync.wav`;
+    const jsonPath = `audios/api_lipsync.json`;
+
+    await fs.writeFile(mp3Path, audioBuffer);
+    console.log("💋 Audio written, starting FFmpeg...");
+
+    await execCommand(`"${FFMPEG_PATH}" -y -i "${mp3Path}" "${wavPath}"`);
+    console.log("💋 WAV ready, starting Rhubarb...");
+
+    await execCommand(
+      `"${RHUBARB_PATH}" -f json -o "${jsonPath}" "${wavPath}" -r phonetic`
+    );
+    console.log("💋 Rhubarb done");
+
+    const lipsync = await readJsonTranscript(jsonPath);
+    console.log(`💋 Mouth cues: ${lipsync.mouthCues?.length}`);
+    res.send({ lipsync });
+  } catch (err) {
+    console.error("Lip-sync error:", err);
+    res.status(500).send({ error: err.message });
+  }
+});
+
+app.post("/set-transcript", (req, res) => {
+  latestTranscript = req.body.transcript || "";
+  console.log("📥 Transcript received:", latestTranscript);
+  res.send({ ok: true });
+});
+
+app.get("/get-transcript", (req, res) => {
+  res.send({ transcript: latestTranscript });
+  latestTranscript = ""; // clear after reading
+});
+
+let pythonMode       = false;   // true = Python is in charge, React must stay silent
+let latestAvatarPayload = null; // stores the payload Python sends
+
+// ── Python calls this BEFORE Get Diagnosis starts processing ────────────────
+app.post("/python-mode", (req, res) => {
+  pythonMode = req.body.active === true;
+  console.log("🐍 pythonMode:", pythonMode);
+  res.json({ ok: true, pythonMode });
+});
+
+// ── React polls this to know whether to stay silent ────────────────────────
+app.get("/python-mode", (req, res) => {
+  res.json({ pythonMode });
+});
+
+// ── Python pushes full avatar payload here ─────────────────────────────────
+app.post("/play-avatar", (req, res) => {
+  const { text, audio, lipsync } = req.body;
+  if (!audio) return res.status(400).json({ error: "audio required" });
+
+  latestAvatarPayload = {
+    text,
+    audio,
+    lipsync:          lipsync || { mouthCues: [] },
+    facialExpression: "smile",
+    animation:        "Talking_1",
+    timestamp:        Date.now(),
+  };
+  console.log("✅ /play-avatar stored:", text?.slice(0, 60));
+  res.json({ ok: true });
+});
+
+// ── React polls this to pick up the payload ────────────────────────────────
+app.get("/get-avatar-payload", (req, res) => {
+  if (!latestAvatarPayload) return res.json({ payload: null });
+  const p         = latestAvatarPayload;
+  latestAvatarPayload = null;   // one-shot — clear after reading
+  res.json({ payload: p });
+});
+
+// import { exec } from "child_process";
+// import cors from "cors";
+// import dotenv from "dotenv";
+// import express from "express";
+// import { promises as fs } from "fs";
+// import Groq from "groq-sdk";
+
+// dotenv.config();
+
+// const groq = new Groq({
+//   apiKey: process.env.GROQ_API_KEY,
+// });
+
+// const murfApiKey = process.env.MURF_API_KEY;
+
+// const MURF_VOICE_ID = process.env.MURF_VOICE_ID || "Natalie";
+// const MURF_LOCALE = process.env.MURF_LOCALE || "en-US";
+
+// const app = express();
+// app.use(express.json({ limit: "50mb" }));
+// app.use(express.urlencoded({ limit: "50mb", extended: true }));
+// app.use(cors());
+
+// const port = process.env.PORT || 3125;
+
+// const RHUBARB_PATH =
+//   "C:\\Rhubarb\\Rhubarb-Lip-Sync-1.14.0-Windows\\rhubarb.exe";
+
+// const FFMPEG_PATH =
+//   "C:\\ffmpeg-2026-03-26-git-fd9f1e9c52-essentials_build\\bin\\ffmpeg.exe";
+
+// app.get("/", (req, res) => {
+//   res.send("Groq + Murf Virtual Doctor backend is running");
+// });
+
+// app.get("/voices", async (req, res) => {
+//   try {
+//     if (!murfApiKey) {
+//       return res.status(400).send({ error: "MURF_API_KEY is missing" });
+//     }
+
+//     const response = await fetch("https://api.murf.ai/v1/speech/voices", {
+//       method: "GET",
+//       headers: {
+//         "api-key": murfApiKey,
+//       },
+//     });
+
+//     if (!response.ok) {
+//       const errText = await response.text();
+//       throw new Error(`Murf voices error: ${response.status} - ${errText}`);
+//     }
+
+//     const voices = await response.json();
+//     return res.send(voices);
+//   } catch (error) {
+//     console.error("Voices fetch error:", error);
+//     return res.status(500).send({
+//       error: "Failed to fetch Murf voices",
+//       details: error.message,
+//     });
+//   }
+// });
+
+// const execCommand = (command) => {
+//   return new Promise((resolve, reject) => {
+//     exec(command, (error, stdout, stderr) => {
+//       if (error) {
+//         console.error("Exec Error:", error);
+//         console.error("stderr:", stderr);
+//         reject(error);
+//         return;
+//       }
+
+//       if (stderr) {
+//         console.warn("Command stderr:", stderr);
+//       }
+
+//       resolve(stdout);
+//     });
+//   });
+// };
+
+// const ensureAudiosFolder = async () => {
+//   try {
+//     await fs.mkdir("audios", { recursive: true });
+//   } catch (error) {
+//     console.error("Error creating audios folder:", error);
+//   }
+// };
+
+// const readJsonTranscript = async (file) => {
+//   const data = await fs.readFile(file, "utf8");
+//   return JSON.parse(data);
+// };
+
+// const audioFileToBase64 = async (file) => {
+//   const data = await fs.readFile(file);
+//   return data.toString("base64");
+// };
+
+// const downloadFile = async (url, outputFilePath) => {
+//   const response = await fetch(url);
+
+//   if (!response.ok) {
+//     const errText = await response.text();
+//     throw new Error(`Audio download failed: ${response.status} - ${errText}`);
+//   }
+
+//   const arrayBuffer = await response.arrayBuffer();
+//   const buffer = Buffer.from(arrayBuffer);
+//   await fs.writeFile(outputFilePath, buffer);
+// };
+
+// const generateMurfAudio = async (text, outputFilePath) => {
+//   if (!murfApiKey) {
+//     throw new Error("MURF_API_KEY is missing");
+//   }
+
+//   const response = await fetch("https://api.murf.ai/v1/speech/generate", {
+//     method: "POST",
+//     headers: {
+//       "api-key": murfApiKey,
+//       "Content-Type": "application/json",
+//     },
+//     body: JSON.stringify({
+//       text,
+//       voiceId: MURF_VOICE_ID,
+//       locale: MURF_LOCALE,
+//       format: "MP3",
+//       sampleRate: 44100,
+//       channelType: "MONO",
+//       encodeAsBase64: true,
+//       modelVersion: "GEN2",
+//       rate: 0,
+//       pitch: 0,
+//       variation: 1,
+//     }),
+//   });
+
+//   if (!response.ok) {
+//     const errText = await response.text();
+//     throw new Error(`Murf TTS failed: ${response.status} - ${errText}`);
+//   }
+
+//   const data = await response.json();
+
+//   if (data?.encodedAudio) {
+//     const buffer = Buffer.from(data.encodedAudio, "base64");
+//     await fs.writeFile(outputFilePath, buffer);
+//     return;
+//   }
+
+//   if (data?.audioFile) {
+//     await downloadFile(data.audioFile, outputFilePath);
+//     return;
+//   }
+
+//   throw new Error("Murf response did not contain encodedAudio or audioFile");
+// };
+
+// const lipSyncMessage = async (messageIndex) => {
+//   const time = Date.now();
+//   console.log(`Starting conversion for message ${messageIndex}`);
+
+//   const mp3Path = `audios/message_${messageIndex}.mp3`;
+//   const wavPath = `audios/message_${messageIndex}.wav`;
+//   const jsonPath = `audios/message_${messageIndex}.json`;
+
+//   await execCommand(`"${FFMPEG_PATH}" -y -i "${mp3Path}" "${wavPath}"`);
+//   console.log(`MP3 to WAV done in ${Date.now() - time}ms`);
+
+//   await execCommand(
+//     `"${RHUBARB_PATH}" -f json -o "${jsonPath}" "${wavPath}" -r phonetic`
+//   );
+//   console.log(`Lip sync done in ${Date.now() - time}ms`);
+// };
+
+// app.post("/chat", async (req, res) => {
+//   try {
+//     if (pythonMode) {
+//       console.log("🔒 /chat blocked — pythonMode active");
+//       return res.status(423).json({ error: "python mode active" });
+//     }
+
+//     await ensureAudiosFolder();
+
+//     const userMessage = req.body.message;
+
+//     if (!userMessage) {
+//       return res.send({
+//         messages: [
+//           {
+//             text: "Hello! I am Dr. Aura, your virtual health assistant. How are you feeling today?",
+//             audio: await audioFileToBase64("audios/intro_0.wav"),
+//             lipsync: await readJsonTranscript("audios/intro_0.json"),
+//             facialExpression: "smile",
+//             animation: "Talking_1",
+//           },
+//           {
+//             text: "Please describe your symptoms and I will do my best to help you.",
+//             audio: await audioFileToBase64("audios/intro_1.wav"),
+//             lipsync: await readJsonTranscript("audios/intro_1.json"),
+//             facialExpression: "default",
+//             animation: "Talking_0",
+//           },
+//         ],
+//       });
+//     }
+
+//     if (!murfApiKey || !process.env.GROQ_API_KEY) {
+//       return res.send({
+//         messages: [
+//           {
+//             text: "I'm sorry, there seems to be a configuration issue with the system.",
+//             audio: await audioFileToBase64("audios/api_0.wav"),
+//             lipsync: await readJsonTranscript("audios/api_0.json"),
+//             facialExpression: "sad",
+//             animation: "Talking_1",
+//           },
+//           {
+//             text: "Please contact the administrator to ensure all API keys are set correctly.",
+//             audio: await audioFileToBase64("audios/api_1.wav"),
+//             lipsync: await readJsonTranscript("audios/api_1.json"),
+//             facialExpression: "default",
+//             animation: "Talking_0",
+//           },
+//         ],
+//       });
+//     }
+
+//     const completion = await groq.chat.completions.create({
+//       model: "llama-3.3-70b-versatile",
+//       temperature: 0.6,
+//       max_tokens: 1000,
+//       messages: [
+//         {
+//           role: "system",
+//           content: `
+// You are Dr. Aura, a virtual doctor assistant. You are professional, calm, caring, and knowledgeable.
+// Always reply ONLY in valid JSON.
+
+// Format:
+// {
+//   "messages": [
+//     {
+//       "text": "string",
+//       "facialExpression": "smile | sad | angry | surprised | funnyFace | default",
+//       "animation": "Talking_0 | Talking_1 | Talking_2 | Crying | Laughing | Rumba | Idle | Terrified | Angry"
+//     }
+//   ]
+// }
+
+// Rules:
+// - Maximum 3 messages
+// - Always respond in a calm, professional, and empathetic medical tone
+// - Give helpful general health information based on described symptoms
+// - Always remind the user to consult a real licensed doctor for proper diagnosis and treatment
+// - Never prescribe specific medications or exact dosages
+// - If the user describes an emergency, urgently advise them to call emergency services immediately
+// - No extra explanation outside the JSON
+// - No markdown
+// - No text outside JSON
+//           `,
+//         },
+//         {
+//           role: "user",
+//           content: userMessage || "Hello",
+//         },
+//       ],
+//     });
+
+//     const raw = completion.choices[0]?.message?.content || "";
+//     console.log("Groq raw response:", raw);
+
+//     let messages;
+
+//     try {
+//       const parsed = JSON.parse(raw);
+//       messages = parsed.messages ? parsed.messages : parsed;
+//     } catch (error) {
+//       console.error("JSON parse error:", error);
+//       messages = [
+//         {
+//           text: raw || "I'm sorry, I could not process that properly. Could you please repeat your symptoms?",
+//           facialExpression: "default",
+//           animation: "Talking_1",
+//         },
+//       ];
+//     }
+
+//     if (!Array.isArray(messages)) {
+//       messages = [messages];
+//     }
+
+//     for (let i = 0; i < messages.length; i++) {
+//       const message = messages[i];
+//       const fileName = `audios/message_${i}.mp3`;
+//       const textInput = message.text || "Hello";
+
+//       console.log(`Generating audio for message ${i}: ${textInput}`);
+
+//       try {
+//         await generateMurfAudio(textInput, fileName);
+//         await lipSyncMessage(i);
+
+//         message.audio = await audioFileToBase64(fileName);
+//         message.lipsync = await readJsonTranscript(`audios/message_${i}.json`);
+//       } catch (ttsError) {
+//         console.error(`TTS/Lipsync failed for message ${i}:`, ttsError.message);
+//         message.audio = null;
+//         message.lipsync = { mouthCues: [] };
+//       }
+//     }
+
+//     return res.send({ messages });
+//   } catch (error) {
+//     console.error("Chat route error:", error);
+//     return res.status(500).send({
+//       error: "Something went wrong in /chat",
+//       details: error.message,
+//     });
+//   }
+// });
+
+// app.listen(port, () => {
+//   console.log(`Virtual Doctor listening on port ${port}`);
+//   console.log(`Rhubarb path: ${RHUBARB_PATH}`);
+//   console.log(`FFmpeg path: ${FFMPEG_PATH}`);
+//   console.log(`Murf voice: ${MURF_VOICE_ID}`);
+//   console.log(`Murf locale: ${MURF_LOCALE}`);
+// });
+
+// let latestTranscript = "";
+
+// app.post("/lip-sync", async (req, res) => {
+//   try {
+//     await ensureAudiosFolder();
+//     const { audioBase64 } = req.body;
+//     if (!audioBase64) return res.status(400).send("No audioBase64 provided");
+
+//     console.log(`💋 Lip-sync audio size: ${audioBase64.length} chars`);
+
+//     const audioBuffer = Buffer.from(audioBase64, "base64");
+//     const mp3Path  = `audios/api_lipsync.mp3`;
+//     const wavPath  = `audios/api_lipsync.wav`;
+//     const jsonPath = `audios/api_lipsync.json`;
+
+//     await fs.writeFile(mp3Path, audioBuffer);
+//     console.log("💋 Audio written, starting FFmpeg...");
+
+//     await execCommand(`"${FFMPEG_PATH}" -y -i "${mp3Path}" "${wavPath}"`);
+//     console.log("💋 WAV ready, starting Rhubarb...");
+
+//     await execCommand(
+//       `"${RHUBARB_PATH}" -f json -o "${jsonPath}" "${wavPath}" -r phonetic`
+//     );
+//     console.log("💋 Rhubarb done");
+
+//     const lipsync = await readJsonTranscript(jsonPath);
+//     console.log(`💋 Mouth cues: ${lipsync.mouthCues?.length}`);
+//     res.send({ lipsync });
+//   } catch (err) {
+//     console.error("Lip-sync error:", err);
+//     res.status(500).send({ error: err.message });
+//   }
+// });
+
+// app.post("/set-transcript", (req, res) => {
+//   latestTranscript = req.body.transcript || "";
+//   console.log("📥 Transcript received:", latestTranscript);
+//   res.send({ ok: true });
+// });
+
+// app.get("/get-transcript", (req, res) => {
+//   res.send({ transcript: latestTranscript });
+//   latestTranscript = "";
+// });
+
+// let pythonMode = false;
+// let latestAvatarPayload = null;
+
+// app.post("/python-mode", (req, res) => {
+//   pythonMode = req.body.active === true;
+//   console.log("🐍 pythonMode:", pythonMode);
+//   res.json({ ok: true, pythonMode });
+// });
+
+// app.get("/python-mode", (req, res) => {
+//   res.json({ pythonMode });
+// });
+
+// app.post("/play-avatar", (req, res) => {
+//   const { text, audio, lipsync } = req.body;
+//   if (!audio) return res.status(400).json({ error: "audio required" });
+
+//   latestAvatarPayload = {
+//     text,
+//     audio,
+//     lipsync:          lipsync || { mouthCues: [] },
+//     facialExpression: "default",
+//     animation:        "Talking_0",
+//     timestamp:        Date.now(),
+//   };
+//   console.log("✅ /play-avatar stored:", text?.slice(0, 60));
+//   res.json({ ok: true });
+// });
+
+// app.get("/get-avatar-payload", (req, res) => {
+//   if (!latestAvatarPayload) return res.json({ payload: null });
+//   const p = latestAvatarPayload;
+//   latestAvatarPayload = null;
+//   res.json({ payload: p });
+// });

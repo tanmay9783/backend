@@ -1,0 +1,13 @@
+# Railway / Render Nixpacks config
+# Installs ffmpeg system-wide so the backend can convert MP3 → WAV for lip sync.
+# Rhubarb Lip Sync has no official Linux binary via Nix, so it is skipped here.
+# If you need Rhubarb on the server, use the Dockerfile approach instead.
+
+[phases.setup]
+nixPkgs = ["ffmpeg"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "npm start"
